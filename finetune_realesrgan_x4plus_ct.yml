@@ -1,0 +1,198 @@
+# options/finetune_realesrgan_x4plus_ct.yml
+
+name: FineTune_RealESRGAN_x4plus_CTRate # Change experiment name
+model_type: RealESRGANModel
+scale: 4
+num_gpu: 1 # Set to 1 if using a single GPU
+manual_seed: 0
+
+datasets:
+  train:
+    name: CustomCT_Train
+    # --- Use your custom dataset class ---
+    type: RealESRGANCustomCTDataset # *** Match the registered class name ***
+
+    # --- Parameters for CTRateDatasetBase ---
+    dataroot_gt: /path/to/your/ct_volumes/root_directory # Root dir containing .nii.gz
+    metadata_csv: /path/to/your/metadata.csv # Path to metadata CSV
+    target_spacing: [0.75, 0.75, 1.5] # Target spacing (X, Y, Z) - Check order expected by utils!
+    target_shape: [512, 512, 240]    # Target shape (X, Y, Z) - Check order expected by utils!
+
+    # --- Parameters for RealESRGANCustomCTDataset Wrapper ---
+    gt_size: 512           # HR patch size for training (e.g., match target_shape X/Y)
+    depth: 1               # Number of slices per patch (use 1 for compatibility)
+    drop: 0                # Slices to drop between patches (usually 0 if depth=1)
+    hu_window_min: -1000   # Min HU value for windowing/scaling
+    hu_window_max: 1000    # Max HU value for windowing/scaling
+
+    # Data augmentation
+    use_hflip: true
+    use_rot: true
+
+    # --- Degradation Parameters (Copy from finetune_realesrgan_x4plus.yml or adjust) ---
+    # 1st stage
+    blur_kernel_size: 21
+    kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso', 'sinc']
+    kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03, 0] # Sinc prob handled separately
+    blur_sigma: [0.2, 3]
+    betag_range: [0.5, 4]
+    betap_range: [1, 2]
+    sinc_prob: 0.1
+
+    # 2nd stage (optional, can remove if not needed)
+    blur_kernel_size2: 21
+    kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso', 'sinc']
+    kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03, 0]
+    blur_sigma2: [0.2, 1.5]
+    betag_range2: [0.5, 4]
+    betap_range2: [1, 2]
+    sinc_prob2: 0.1
+
+    # Noise and JPEG
+    noise_range: [1, 10]   # Adjust noise level for CT
+    jpeg_range: [30, 95]   # Adjust JPEG quality? Maybe higher? [60, 95] or disable? set to ~
+
+    final_sinc_prob: 0.1
+
+    # Batch size and workers - Adjust based on VRAM and CPU/IO
+    # Loading NIfTI is slower, so more workers might help if CPU is bottleneck
+    batch_size_per_gpu: 4  # Start lower due to larger data size?
+    num_worker_per_gpu: 4  # Increase if IO/CPU allows
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~ # or 'cuda' if using prefetcher
+
+    # --- IO backend - Not strictly needed, but keep for structure ---
+    io_backend:
+      type: disk
+
+
+  # --- Validation Dataset ---
+  # Option 1: Use a similar custom dataset for validation (if you have validation NIfTI files)
+  # val:
+  #   name: CustomCT_Val
+  #   type: RealESRGANCustomCTDataset # Use the same class
+  #   dataroot_gt: /path/to/your/validation_ct_volumes/
+  #   metadata_csv: /path/to/your/validation_metadata.csv
+  #   target_spacing: [0.75, 0.75, 1.5]
+  #   target_shape: [512, 512, 240]
+  #   gt_size: 512
+  #   depth: 1
+  #   drop: 0
+  #   hu_window_min: -1000
+  #   hu_window_max: 1000
+  #   # Validation doesn't need degradations - the wrapper should ideally skip them if is_train=False
+  #   # Need to modify the wrapper slightly to handle train/val mode if using it for validation.
+  #   # OR create a simpler validation dataset that just loads GT patches.
+
+  # Option 2: Pre-generate paired validation images (easier setup)
+  val:
+    name: Val_CT_Paired
+    type: PairedImageDataset
+    dataroot_gt: /path/to/saved/validation/gt_patches # Directory with GT PNGs
+    dataroot_lq: /path/to/saved/validation/lq_patches # Directory with LQ PNGs (generated manually or via a script)
+    io_backend:
+      type: disk
+
+
+# --- Network Structures ---
+network_g:
+  type: RRDBNet
+  num_in_ch: 3  # Using 3 channels due to GRAY->BGR conversion for pre-trained model
+  num_out_ch: 3 # Model outputs 3 channels
+  num_feat: 64
+  num_block: 23
+  num_grow_ch: 32
+  scale: 4
+
+network_d:
+  type: UNetDiscriminatorSN
+  num_in_ch: 3  # Discriminator sees 3 channels
+  num_feat: 64
+  skip_connection: True
+
+# --- Path Settings ---
+path:
+  pretrain_network_g: experiments/pretrained_models/RealESRGAN_x4plus.pth
+  pretrain_network_d: experiments/pretrained_models/RealESRGAN_x4plus_netD.pth
+  strict_load_g: true
+  strict_load_d: true
+  resume_state: ~
+
+# --- Training Settings (Fine-tuning) ---
+train:
+  ema_decay: 0.999
+  optim_g:
+    type: Adam
+    lr: !!float 1e-5 # Fine-tuning learning rate
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  optim_d:
+    type: Adam
+    lr: !!float 1e-5 # Fine-tuning learning rate
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [250000, 250000, 250000, 250000] # Adjust total iterations/schedule
+    restart_weights: [1, 1, 1, 1]
+    eta_min: !!float 1e-7
+
+  total_iter: 500000 # Adjust total iterations for fine-tuning (e.g., fewer than training from scratch)
+  warmup_iter: -1
+
+  # Losses
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+  perceptual_opt:
+    type: PerceptualLoss
+    layer_weights: # Standard VGG layer weights
+      'conv1_2': 0.1
+      'conv2_2': 0.1
+      'conv3_4': 1.0
+      'conv4_4': 1.0
+      'conv5_4': 1.0
+    vgg_type: vgg19
+    use_input_norm: true
+    perceptual_weight: 1.0
+    style_weight: 0
+    range_norm: false
+    criterion: l1
+  gan_opt:
+    type: GANLoss
+    gan_type: vanilla
+    real_label_val: 1.0
+    fake_label_val: 0.0
+    loss_weight: 0.1 # Adjust GAN weight if needed
+
+  net_d_steps: 1
+  net_d_init_iters: 0
+
+# --- Validation Settings ---
+val:
+  val_freq: !!float 5e3
+  save_img: true
+  # Metrics depend on your validation dataset type
+  metrics:
+    psnr: # PSNR calculated on the output tensor (range [0, 1])
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: false # False if comparing RGB/BGR directly
+    ssim:
+     type: calculate_ssim
+     crop_border: 4
+     test_y_channel: false
+
+# --- Logging ---
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 5e3
+  use_tb_logger: true
+  # wandb: ... # Optional WandB setup
+
+# --- Distributed Training ---
+dist_params:
+  backend: nccl
+  port: 29501 # Use a different port if running multiple experiments

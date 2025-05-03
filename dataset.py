@@ -1,100 +1,144 @@
+import ast
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+import pandas as pd
 from skimage.transform import resize
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms as T
 
-
-class CTDataset(Dataset):
-    def __init__(
-        self, data_dir, transform=None, slice_depth=5, slice_drop=2, target_size=128
-    ):
-        """
-        Args:
-            data_dir (str): Path to the directory where .nii.gz files are stored.
-            transform (callable, optional): Optional transform to be applied on a sample.
-            slice_depth (int): Number of slices to be taken as input tensor channels.
-            slice_drop (int): Number of slices to drop between tensors.
-            target_size (int): The target size for resizing images.
-        """
-        self.data_dir = Path(data_dir)
-        self.transform = transform
-        self.slice_depth = slice_depth
-        self.slice_drop = slice_drop
-        self.target_size = target_size
-        self.samples = []  # List to store file paths
-
-        # Traverse through dataset directory and gather all .nii.gz file paths
-        for split in ["train", "valid"]:  # Assuming we have train/valid directories
-            split_path = self.data_dir / split
-            for case_folder in split_path.iterdir():
-                if case_folder.is_dir():
-                    for nii_file in case_folder.glob("*.nii.gz"):
-                        self.samples.append(str(nii_file))  # Append path to the list
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        # Load the CT volume from the .nii.gz file
-        nii_file = self.samples[idx]
-        volume = self.load_nii(nii_file)
-
-        # Extract patches with the slice depth and drop strategy
-        patches = self.extract_patches(volume)
-
-        # Apply any transformations (e.g., normalization, augmentation) if provided
-        if self.transform:
-            patches = [self.transform(patch) for patch in patches]
-
-        return patches
-
-    def load_nii(self, filepath):
-        """Load NIfTI image and normalize it."""
-        img = nib.load(filepath).get_fdata()
-        img = np.clip(img, -1000, 1000)  # HU windowing
-        img = (img + 1000) / 2000  # Normalize to 0–1
-        return img
-
-    def extract_patches(self, volume):
-        """Extract 3D patches with given slice depth and drop strategy."""
-        inputs = []
-        total_slices = volume.shape[2]
-        i = 0
-
-        while i + self.slice_depth <= total_slices:
-            stack = volume[:, :, i : i + self.slice_depth]  # H x W x depth
-            stack = np.transpose(stack, (2, 0, 1))  # depth x H x W
-            stack_resized = np.zeros(
-                (self.slice_depth, self.target_size, self.target_size)
-            )
-
-            for j in range(self.slice_depth):
-                stack_resized[j] = resize(
-                    stack[j], (self.target_size, self.target_size), preserve_range=True
-                )
-
-            tensor = torch.tensor(stack_resized, dtype=torch.float32)
-            inputs.append(tensor)
-            i += self.slice_depth + self.slice_drop
-
-        return inputs
+from utils import convert_to_hu, crop_or_pad, resample_volume, extract_patches
 
 
 class CustomTransform:
-    def __call__(self, tensor):
-        # Normalizing the input tensor to [-1, 1] (optional, can be skipped)
-        return (tensor - 0.5) * 2  # If needed, normalize to [-1, 1] from [0, 1]
+    def __call__(self, image):
+        # Normalize to [0, 1]
+        image = (image + 1000.0) / 2000.0  # HU values are in [-1000, 1000] range
+        T.ToTensor(),  # Convert image to PyTorch tensor
+        T.Normalize(mean=[0.5], std=[0.5])  # Normalize the tensor values to [-1, 1]
+        return image
 
 
-def create_dataloader(data_dir, batch_size=8, shuffle=True, num_workers=4):
+class CTRateDataset(Dataset):
+    def __init__(
+        self,
+        root_dir,
+        metadata_csv,
+        transform=None,
+        depth=3,
+        size_low=128,
+        size_high=512,
+        drop=0,
+        target_spacing=(0.75, 0.75, 1.5),  # x,y,z
+        target_shape=(512, 512, 240),
+    ):
+        """
+        Args:
+            root_dir (str): Directory where the .nii.gz files are located.
+            metadata_csv (str): Path to the CSV file containing metadata.
+            transform (callable, optional): Optional transform to be applied on a sample.
+            target_spacing (tuple): Desired spacing for resampling (default is (0.75, 0.75, 1.5)).
+            target_shape (tuple): Desired shape for padding/cropping (default is (480, 480, 240)).
+            depth (int): Number of consecutive slices to include in each patch.
+            size (int): Desired size for each patch (default is 128).
+            drop (int): Number of slices to skip between patches.
+        """
+        self.root_dir = Path(root_dir)
+        self.metadata = pd.read_csv(metadata_csv)  # Load metadata
+        self.transform = transform
+        self.target_spacing = target_spacing
+        self.target_shape = target_shape
+        self.depth = depth
+        self.size_low = size_low
+        self.size_high = size_high
+        self.drop = drop
+        self.samples = list(self.root_dir.rglob("*.nii.gz"))
+        self.valid_samples = self.filter_invalid_samples()
+
+    def filter_invalid_samples(self):
+        """Filters out samples with NaN values in critical metadata columns."""
+        valid_samples = []
+        invalid_samples = self.metadata.loc[
+            self.metadata["ZSpacing"].isna(), "VolumeName"
+        ]
+        for sample in self.samples:
+            if sample.name not in invalid_samples:
+                valid_samples.append(sample)
+        return valid_samples
+
+    def __len__(self):
+        return len(self.valid_samples)
+
+    def __getitem__(self, idx):
+        nii_path = self.valid_samples[idx]
+        volume_name = nii_path.name
+        volume_metadata = self.get_metadata_for_volume(volume_name)
+
+        # Load the NIfTI image
+        img = nib.load(nii_path)
+        volume = img.get_fdata()
+
+        # Use metadata for RescaleSlope, RescaleIntercept, and spacing
+        rescale_intercept = volume_metadata["RescaleIntercept"]
+        rescale_slope = volume_metadata["RescaleSlope"]
+        spacing = ast.literal_eval(volume_metadata["XYSpacing"]) + [
+            int(volume_metadata["ZSpacing"])
+        ]
+
+        # 1. Convert volume to HU using metadata
+        volume = convert_to_hu(volume, rescale_slope, rescale_intercept)
+
+        # 2. Resample volume to target spacing
+        volume = resample_volume(
+            volume, spacing[::-1], target_spacing=self.target_spacing
+        )
+
+        # 3. Crop or pad the volume to the desired shape
+        volume = crop_or_pad(volume, target_shape=self.target_shape)
+
+        # 5. Extract patches (slices) from the volume
+        hr_patches = extract_patches(volume, self.depth, self.drop, self.size_high)
+        lr_patches = extract_patches(volume, self.depth, self.drop, self.size_low)
+
+        # Apply any transformations (if provided)
+        if self.transform:
+            lr_patches = [self.transform(patch) for patch in lr_patches]
+            hr_patches = [self.transform(patch) for patch in hr_patches]
+
+        # Return a tuple of (low-resolution patches, high-resolution target)
+        return lr_patches, hr_patches
+
+
+def create_dataloader(
+    data_dir,
+    metadata_csv,
+    batch_size=8,
+    shuffle=True,
+    num_workers=4,
+    depth=3,
+    size_low=128,
+    size_high=512,
+    drop=0,
+    target_spacing=(0.75, 0.75, 1.5),
+    target_shape=(512, 512, 240),
+):
     # Define the transformation for the data (optional)
     transform = CustomTransform()
 
     # Initialize the dataset
-    dataset = CTDataset(data_dir=data_dir, transform=transform)
+    dataset = CTRateDataset(
+        data_dir,
+        metadata_csv,
+        transform,
+        depth,
+        size_low,
+        size_high,
+        drop,
+        target_spacing,
+        target_shape,
+    )
 
     # Create DataLoader for batching
     dataloader = DataLoader(
