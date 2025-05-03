@@ -75,8 +75,8 @@ class CTRateDatasetBase(Dataset):
                     }
                     self.samples.append(nii_path)
                     self.num_slices += (
-                        meta["NumberofSlices"]
-                        if self.target_shape == -1
+                        int(meta["NumberofSlices"])
+                        if self.target_shape[2] == -1
                         else self.target_shape[2]
                     )
 
