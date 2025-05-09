@@ -69,7 +69,7 @@ datasets:
     betag_range: [0.5, 4]
     betap_range: [1, 2]
 
-    blur_kernel_size2: 21
+    blur_kernel_size2: 7
     kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
     kernel_prob2: [0.25, 0.15, 0.05, 0.02, 0.05, 0.02]
     sinc_prob2: 0.1
@@ -89,6 +89,9 @@ datasets:
     use_hflip: False
     use_rot: False
 
+    batch_size_per_gpu: 4  # Start lower due to larger data size?
+    num_worker_per_gpu: 4  # Increase if IO/CPU allows
+
   # --- Validation Dataset ---
   # Option 1: Use a similar custom dataset for validation (if you have validation NIfTI files)
   val:
@@ -103,6 +106,30 @@ datasets:
     drop: 0
     hu_window_min: -1000
     hu_window_max: 1000
+
+    batch_size_per_gpu: 4  # Start lower due to larger data size?
+    num_worker_per_gpu: 4  # Increase if IO/CPU allows
+
+    use_hflip: False
+    use_rot: False
+
+    blur_kernel_size: 0
+    kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob: [0, 0, 0, 0, 0, 0]
+    sinc_prob: 0.0
+    blur_sigma: [0.2, 3]
+    betag_range: [0.5, 4]
+    betap_range: [1, 2]
+
+    blur_kernel_size2: 0
+    kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob2: [0, 0, 0, 0, 0, 0]
+    sinc_prob2: 0.0
+    blur_sigma2: [0.2, 1.5]
+    betag_range2: [0.5, 4]
+    betap_range2: [1, 2]
+
+    final_sinc_prob: 0.0
     # Validation doesn't need degradations - the wrapper should ideally skip them if is_train=False
     # Need to modify the wrapper slightly to handle train/val mode if using it for validation.
     # OR create a simpler validation dataset that just loads GT patches.
@@ -163,7 +190,7 @@ train:
     restart_weights: [1, 1, 1, 1]
     eta_min: !!float 1e-7
 
-  total_iter: 100000 # Adjust total iterations for fine-tuning (e.g., fewer than training from scratch)
+  total_iter: 10000 # Adjust total iterations for fine-tuning (e.g., fewer than training from scratch)
   warmup_iter: -1
 
   # Losses
